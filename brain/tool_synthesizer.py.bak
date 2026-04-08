@@ -1,0 +1,874 @@
+"""Tool Synthesizer — LLM-powered Python tool code generation with validation."""
+from __future__ import annotations
+
+import ast
+import logging
+import re
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+class ToolSynthesizer:
+    """Generates Python tool functions using the local Ollama LLM.
+
+    Handles prompt construction, code extraction from LLM response,
+    validation, sandbox testing, and registration. Retries with
+    increasing temperature on failure.
+    """
+
+    SYNTHESIS_SYSTEM_PROMPT: str = (
+        "You are a Python code generator. You write single, self-contained Python functions.\n"
+        "Rules:\n"
+        "- Write exactly ONE function, no classes\n"
+        "- Include full type hints and a docstring\n"
+        "- Handle ALL exceptions with try/except\n"
+        '- Always return: {"success": bool, "result": any, "error": str or None}\n'
+        "- Maximum 50 lines of code\n"
+        "- Safe imports allowed: json, os.path, pathlib, re, datetime, math, "
+        "collections, hashlib, typing, requests, psutil, GPUtil, pyperclip, "
+        "pandas, numpy, bs4, pydantic, time, statistics, csv, base64, uuid\n"
+        "- NEVER use: eval, exec, subprocess, shutil, open() in write mode, socket, ctypes, threading\n"
+        "- Output ONLY the Python code inside a ```python code block\n"
+        "- The function name should be descriptive and snake_case\n"
+        "- For system info tools (uptime, CPU/GPU temperature, RAM, disk, ports, processes): "
+        "use psutil or GPUtil directly with ZERO parameters. These are system queries — "
+        "data comes from the OS, not from user input. "
+        "Key APIs: time.time()-psutil.boot_time() for uptime, "
+        "psutil.net_connections(kind='inet') for ports, "
+        "GPUtil.getGPUs()[0].temperature for GPU temp, "
+        "psutil.sensors_temperatures() for CPU temp, "
+        "pyperclip.paste() for clipboard."
+    )
+
+    def __init__(
+        self,
+        config: dict,
+        llm_core,
+        code_validator,
+        sandbox_executor,
+        tool_registry,
+        ui_layer,
+    ) -> None:
+        """Initialize the tool synthesizer.
+
+        Args:
+            config: Full JARVIS configuration dictionary.
+            llm_core: LLMCore instance for Ollama calls.
+            code_validator: CodeValidator instance.
+            sandbox_executor: SandboxExecutor instance.
+            tool_registry: ToolRegistry instance.
+            ui_layer: UILayer instance for progress display.
+        """
+        self.config = config
+        self.llm = llm_core
+        self.validator = code_validator
+        self.sandbox = sandbox_executor
+        self.registry = tool_registry
+        self.ui = ui_layer
+        self.tools_dir = Path(config["brain"]["tools_dir"])
+        self.tools_dir.mkdir(parents=True, exist_ok=True)
+        self.max_retries: int = config["brain"]["max_synthesis_retries"]
+
+    REASONING_PROMPT: str = (
+        "You are an expert software architect. Analyze the user's request and produce a structured plan "
+        "for building a Python tool function.\n\n"
+        "You MUST output ONLY a plan in this EXACT format (no extra text):\n\n"
+        "INTENT: <one sentence describing what the user actually wants>\n"
+        "TOOL_NAME: <snake_case function name>\n"
+        "DESCRIPTION: <clear one-line description of what the tool does>\n"
+        "PARAMETERS:\n"
+        "- <param_name> (<type>): <description> [REQUIRED/OPTIONAL]\n"
+        "STEPS:\n"
+        "1. <first step the function must perform>\n"
+        "2. <second step>\n"
+        "...(keep under 8 steps)\n"
+        "EDGE_CASES:\n"
+        "- <potential failure or edge case to handle>\n"
+        "RETURN: <description of what the function returns on success>\n\n"
+        "Rules:\n"
+        "- Understand the REAL intent behind casual/vague language\n"
+        "- Identify ALL required parameters — never leave a critical param out\n"
+        "- Mark required vs optional params clearly\n"
+        "- Think about validation, error handling, edge cases\n"
+        "- Only allowed imports: json, os.path, pathlib, re, datetime, math, "
+        "collections, hashlib, typing, requests, psutil, GPUtil, pyperclip, "
+        "pandas, numpy, time, statistics, csv, base64, uuid\n"
+    )
+
+    async def reason_and_plan(self, task_description: str) -> dict[str, Any] | None:
+        """Analyze user request and produce a structured plan before code generation.
+
+        Uses the LLM to understand the user's real intent, identify parameters,
+        and create a step-by-step implementation plan.
+
+        Args:
+            task_description: Raw user input / natural language request.
+
+        Returns:
+            Parsed plan dict with keys: intent, tool_name, description,
+            parameters, steps, edge_cases, return_desc. None on failure.
+        """
+        self.ui.console.print(
+            "  [dim cyan]>> Reasoning about the request...[/dim cyan]"
+        )
+
+        prompt = (
+            f"User request: \"{task_description}\"\n\n"
+            f"Analyze this request and produce the structured plan."
+        )
+
+        response = await self.llm.generate(
+            prompt,
+            system_prompt=self.REASONING_PROMPT,
+            mode="code",
+        )
+
+        plan = self._parse_plan(response)
+        if plan:
+            self._display_plan(plan)
+        else:
+            logger.warning("Failed to parse reasoning plan, proceeding with raw task")
+
+        return plan
+
+    def _parse_plan(self, response: str) -> dict[str, Any] | None:
+        """Parse the structured plan from LLM response."""
+        try:
+            plan: dict[str, Any] = {}
+
+            # Extract INTENT
+            m = re.search(r"INTENT:\s*(.+)", response)
+            plan["intent"] = m.group(1).strip() if m else ""
+
+            # Extract TOOL_NAME
+            m = re.search(r"TOOL_NAME:\s*(\w+)", response)
+            plan["tool_name"] = m.group(1).strip() if m else ""
+
+            # Extract DESCRIPTION
+            m = re.search(r"DESCRIPTION:\s*(.+)", response)
+            plan["description"] = m.group(1).strip() if m else ""
+
+            # Extract PARAMETERS
+            params = []
+            param_section = re.search(
+                r"PARAMETERS:\s*\n((?:- .+\n?)+)", response
+            )
+            if param_section:
+                for pm in re.finditer(
+                    r"- (\w+)\s*\(([^)]+)\):\s*(.+?)(?:\[(REQUIRED|OPTIONAL)\])?",
+                    param_section.group(1),
+                ):
+                    params.append({
+                        "name": pm.group(1),
+                        "type": pm.group(2).strip(),
+                        "desc": pm.group(3).strip(),
+                        "required": pm.group(4) != "OPTIONAL" if pm.group(4) else True,
+                    })
+            plan["parameters"] = params
+
+            # Extract STEPS
+            steps = []
+            steps_section = re.search(
+                r"STEPS:\s*\n((?:\d+\..+\n?)+)", response
+            )
+            if steps_section:
+                steps = [
+                    s.strip()
+                    for s in re.findall(r"\d+\.\s*(.+)", steps_section.group(1))
+                ]
+            plan["steps"] = steps
+
+            # Extract EDGE_CASES
+            edge_cases = []
+            edge_section = re.search(
+                r"EDGE_CASES:\s*\n((?:- .+\n?)+)", response
+            )
+            if edge_section:
+                edge_cases = [
+                    e.strip()
+                    for e in re.findall(r"- (.+)", edge_section.group(1))
+                ]
+            plan["edge_cases"] = edge_cases
+
+            # Extract RETURN
+            m = re.search(r"RETURN:\s*(.+)", response)
+            plan["return_desc"] = m.group(1).strip() if m else ""
+
+            # Validate minimum fields
+            if not plan.get("tool_name") or not plan.get("steps"):
+                return None
+
+            plan["raw"] = response
+            return plan
+
+        except Exception as exc:
+            logger.warning("Plan parsing error: %s", exc)
+            return None
+
+    def _display_plan(self, plan: dict[str, Any]) -> None:
+        """Display the reasoning plan to the user."""
+        from rich.panel import Panel
+        from rich.text import Text
+
+        lines = []
+        if plan.get("intent"):
+            lines.append(f"[bold white]Intent:[/bold white] {plan['intent']}")
+        if plan.get("tool_name"):
+            lines.append(f"[bold white]Tool:[/bold white] {plan['tool_name']}")
+        if plan.get("description"):
+            lines.append(f"[bold white]Description:[/bold white] {plan['description']}")
+
+        if plan.get("parameters"):
+            lines.append("[bold white]Parameters:[/bold white]")
+            for p in plan["parameters"]:
+                req = "[red]REQUIRED[/red]" if p.get("required") else "[dim]OPTIONAL[/dim]"
+                lines.append(f"  - {p['name']} ({p['type']}): {p['desc']} {req}")
+
+        if plan.get("steps"):
+            lines.append("[bold white]Plan:[/bold white]")
+            for i, step in enumerate(plan["steps"], 1):
+                lines.append(f"  {i}. {step}")
+
+        if plan.get("edge_cases"):
+            lines.append("[bold white]Edge Cases:[/bold white]")
+            for ec in plan["edge_cases"]:
+                lines.append(f"  - {ec}")
+
+        self.ui.console.print(
+            Panel(
+                "\n".join(lines),
+                title="[bold cyan]Brain Reasoning[/bold cyan]",
+                border_style="cyan",
+                padding=(1, 2),
+            )
+        )
+
+    async def synthesize(
+        self,
+        task_description: str,
+        existing_tool_name: str | None = None,
+        plan: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Synthesize a new tool or improve an existing one.
+
+        Attempts up to max_retries times with increasing temperature.
+        Each attempt: generate code → validate → sandbox test → register.
+
+        Args:
+            task_description: Natural language description of what the tool should do.
+            existing_tool_name: If improving, the name of the existing tool to upgrade.
+
+        Returns:
+            Dict with tool metadata on success, None after all retries exhausted.
+        """
+        # ── MCP check — use existing MCP tool instead of synthesizing ─────
+        if hasattr(self, "mcp_client") and self.mcp_client and self.mcp_client.enabled:
+            match = self.mcp_client.find_tool(task_description)
+            if match and match.get("match_score", 0) >= 0.5:
+                logger.info(
+                    "MCP tool found for '%s': %s (score=%.2f) — skipping synthesis.",
+                    task_description[:60], match["name"], match["match_score"],
+                )
+                self.ui.console.print(
+                    f"  [dim green]>> MCP tool available: {match['name']} "
+                    f"(score={match['match_score']}) — no synthesis needed[/dim green]"
+                )
+                return {
+                    "name": match["name"],
+                    "description": match.get("description", ""),
+                    "source": "mcp",
+                    "server": match.get("server", ""),
+                    "mcp_tool": True,
+                }
+        existing_code: str | None = None
+        if existing_tool_name:
+            tool = self.registry.get_by_name(existing_tool_name)
+            if tool:
+                code_path = Path(tool["code_path"])
+                if code_path.exists():
+                    existing_code = code_path.read_text(encoding="utf-8")
+
+        temperatures = [0.1, 0.3, 0.5]
+        last_error = ""
+
+        for attempt in range(self.max_retries):
+            self.ui.console.print(
+                f"  [dim yellow]>> Tool synthesis attempt "
+                f"{attempt + 1}/{self.max_retries}...[/dim yellow]"
+            )
+
+            prompt = self._build_synthesis_prompt(
+                task_description, existing_code, last_error, plan
+            )
+            temp = temperatures[min(attempt, len(temperatures) - 1)]
+
+            response = await self.llm.generate(
+                prompt,
+                system_prompt=self.SYNTHESIS_SYSTEM_PROMPT,
+                mode="code",
+            )
+
+            code = self._extract_code(response)
+            if not code:
+                last_error = "Failed to extract valid Python code from LLM response"
+                logger.warning(
+                    "Synthesis attempt %d: no code extracted", attempt + 1
+                )
+                continue
+
+            # Validate
+            self.ui.console.print(
+                "  [dim cyan]>> Validating generated code...[/dim cyan]"
+            )
+            validation = await self.validator.validate_async(
+                code, ui_layer=self.ui
+            )
+            if not validation.is_valid:
+                last_error = "; ".join(validation.errors)
+                logger.warning(
+                    "Synthesis attempt %d: validation failed: %s",
+                    attempt + 1,
+                    last_error,
+                )
+                continue
+
+            # Extract function metadata
+            metadata = self._extract_metadata(code)
+            if not metadata:
+                last_error = "Could not extract function metadata from generated code"
+                continue
+
+            function_name = metadata["name"]
+            param_schema = metadata["parameters"]
+
+            # Sandbox test
+            self.ui.console.print(
+                "  [dim cyan]>> Testing in sandbox...[/dim cyan]"
+            )
+            test_params = self.sandbox.generate_dummy_params(param_schema)
+            sandbox_result = await self.sandbox.execute(
+                code, function_name, test_params
+            )
+
+            if not sandbox_result["passed"]:
+                last_error = sandbox_result.get("error", "Sandbox test failed")
+                logger.warning(
+                    "Synthesis attempt %d: sandbox failed: %s",
+                    attempt + 1,
+                    last_error,
+                )
+                continue
+
+            # All checks passed — save and register
+            # Use plan's tool name and description if available
+            effective_description = (
+                plan.get("description", task_description) if plan else task_description
+            )
+            tool_name = existing_tool_name or (
+                plan.get("tool_name", function_name) if plan else function_name
+            )
+            version = (
+                self.registry.get_version(tool_name) + 1
+                if existing_tool_name
+                else 1
+            )
+            code_path = self.tools_dir / f"{tool_name}_v{version}.py"
+            code_path.write_text(code, encoding="utf-8")
+
+            tool_id = self.registry.register(
+                name=tool_name,
+                description=effective_description,
+                code_path=str(code_path),
+                parameters=param_schema,
+                created_by="agent",
+                version=version,
+                tags=self._extract_tags(effective_description),
+            )
+
+            self.ui.console.print(
+                f"  [bold green]>> Tool '{tool_name}' v{version} "
+                f"created and registered![/bold green]"
+            )
+
+            return {
+                "tool_id": tool_id,
+                "name": tool_name,
+                "description": effective_description,
+                "code_path": str(code_path),
+                "parameters": param_schema,
+                "version": version,
+                "function_name": function_name,
+            }
+
+        logger.error(
+            "Tool synthesis failed after %d attempts for: %s",
+            self.max_retries,
+            task_description,
+        )
+        self.ui.console.print(
+            f"  [bold red]>> Tool synthesis failed after "
+            f"{self.max_retries} attempts[/bold red]"
+        )
+        return None
+
+    def _build_synthesis_prompt(
+        self,
+        task: str,
+        existing_code: str | None = None,
+        last_error: str = "",
+        plan: dict[str, Any] | None = None,
+    ) -> str:
+        """Build the LLM prompt for code generation.
+
+        Args:
+            task: Task description.
+            existing_code: Code of existing tool to improve (if upgrading).
+            last_error: Error from previous attempt for iterative fixing.
+
+        Returns:
+            Formatted prompt string.
+        """
+        prompt = f"Generate a Python function for this task:\n\nTASK: {task}\n"
+
+        if plan:
+            prompt += f"\n--- REASONING PLAN (follow this closely) ---\n"
+            if plan.get("intent"):
+                prompt += f"Intent: {plan['intent']}\n"
+            if plan.get("tool_name"):
+                prompt += f"Function name must be: {plan['tool_name']}\n"
+            if plan.get("description"):
+                prompt += f"Description: {plan['description']}\n"
+            if plan.get("parameters"):
+                prompt += "Parameters:\n"
+                for p in plan["parameters"]:
+                    req = "REQUIRED" if p.get("required") else "OPTIONAL"
+                    prompt += f"  - {p['name']} ({p['type']}): {p['desc']} [{req}]\n"
+            if plan.get("steps"):
+                prompt += "Implementation steps:\n"
+                for i, step in enumerate(plan["steps"], 1):
+                    prompt += f"  {i}. {step}\n"
+            if plan.get("edge_cases"):
+                prompt += "Edge cases to handle:\n"
+                for ec in plan["edge_cases"]:
+                    prompt += f"  - {ec}\n"
+            if plan.get("return_desc"):
+                prompt += f"Return: {plan['return_desc']}\n"
+            prompt += "--- END PLAN ---\n"
+
+        if existing_code:
+            prompt += (
+                f"\nIMPROVE this existing code (it has low reliability):\n"
+                f"```python\n{existing_code}\n```\n"
+            )
+
+        if last_error:
+            prompt += (
+                f"\nPREVIOUS ATTEMPT FAILED: {last_error}\n"
+                f"Fix the issue in this attempt.\n"
+            )
+
+        prompt += (
+            "\nThe function MUST:\n"
+            "- Accept clear parameters with type hints\n"
+            '- Return {"success": True/False, "result": <value>, "error": None/str}\n'
+            "- Handle all exceptions with try/except\n"
+            "- Be under 50 lines\n"
+            "- Use only safe imports: json, os.path, pathlib, re, datetime, "
+            "math, collections, hashlib, typing, requests, psutil, GPUtil, "
+            "pyperclip, time, statistics, csv, base64, uuid\n"
+            "\nIMPORTANT HINTS:\n"
+            "- For system info tools (uptime, CPU temp, GPU temp, RAM, disk, processes, ports): "
+            "use psutil or GPUtil directly — do NOT add unnecessary parameters. "
+            "Example: psutil.boot_time() returns a UNIX timestamp of when the system booted. "
+            "Calculate uptime = time.time() - psutil.boot_time(). "
+            "psutil.cpu_percent(), psutil.virtual_memory(), psutil.net_connections(), "
+            "psutil.process_iter() are all zero-argument calls.\n"
+            "- For clipboard: use pyperclip.paste() with no arguments.\n"
+            "- For GPU temperature: use GPUtil.getGPUs()[0].temperature.\n"
+            "- For network ports: use psutil.net_connections(kind='inet').\n"
+            "\nOutput ONLY the Python code in a ```python block. No explanations."
+        )
+
+        return prompt
+
+    @staticmethod
+    def _extract_code(response: str) -> str | None:
+        """Extract Python code from LLM response (handles markdown blocks).
+
+        Args:
+            response: Raw LLM response string.
+
+        Returns:
+            Extracted Python code or None if not found/parseable.
+        """
+        # Try ```python ... ``` first
+        match = re.search(r"```python\s*\n(.*?)```", response, re.DOTALL)
+        if match:
+            code = match.group(1).strip()
+            try:
+                ast.parse(code)
+                return code
+            except SyntaxError:
+                pass
+
+        # Try bare ``` ... ```
+        match = re.search(r"```\s*\n(.*?)```", response, re.DOTALL)
+        if match:
+            code = match.group(1).strip()
+            try:
+                ast.parse(code)
+                return code
+            except SyntaxError:
+                pass
+
+        # Try raw response if it looks like code
+        stripped = response.strip()
+        if stripped.startswith(("import ", "from ", "def ")):
+            try:
+                ast.parse(stripped)
+                return stripped
+            except SyntaxError:
+                pass
+
+        return None
+
+    @staticmethod
+    def _extract_metadata(code: str) -> dict[str, Any] | None:
+        """Extract function name, parameters, and docstring from code via AST.
+
+        Args:
+            code: Valid Python source code.
+
+        Returns:
+            Dict with name, parameters, description — or None on failure.
+        """
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return None
+
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, ast.FunctionDef):
+                params: dict[str, str] = {}
+                for arg in node.args.args:
+                    type_str = "Any"
+                    if arg.annotation:
+                        try:
+                            type_str = ast.unparse(arg.annotation)
+                        except (AttributeError, ValueError):
+                            if isinstance(arg.annotation, ast.Name):
+                                type_str = arg.annotation.id
+                            elif isinstance(arg.annotation, ast.Constant):
+                                type_str = str(arg.annotation.value)
+                    params[arg.arg] = type_str
+
+                description = ""
+                if (
+                    node.body
+                    and isinstance(node.body[0], ast.Expr)
+                    and isinstance(node.body[0].value, ast.Constant)
+                    and isinstance(node.body[0].value.value, str)
+                ):
+                    description = node.body[0].value.value
+
+                return {
+                    "name": node.name,
+                    "parameters": params,
+                    "description": description,
+                }
+
+        return None
+
+    @staticmethod
+    def _extract_tags(description: str) -> list[str]:
+        """Extract keyword tags from a task description.
+
+        Args:
+            description: Task description text.
+
+        Returns:
+            List of lowercase keyword tags (max 10).
+        """
+        stop_words = {
+            "a", "an", "the", "to", "for", "of", "in", "on", "and", "or",
+            "is", "it", "with", "from", "by", "at", "this", "that", "my",
+            "me", "can", "you", "how", "what", "do", "does", "will",
+        }
+        words = re.findall(r"\b[a-zA-Z]{3,}\b", description.lower())
+        return list(dict.fromkeys(w for w in words if w not in stop_words))[:10]
+
+    # ══════════════════════════════════════════════════════════════════
+    #  ReAct-aware synthesis with structured retry
+    # ══════════════════════════════════════════════════════════════════
+
+    _REACT_SYNTHESIS_PROMPT: str = (
+        "You are a Python code generator inside a ReAct reasoning loop.\n"
+        "You write single, self-contained Python functions.\n\n"
+        "Rules:\n"
+        "- Write exactly ONE function, no classes\n"
+        "- Include full type hints and a docstring\n"
+        "- Handle ALL exceptions with try/except\n"
+        '- Always return: {"success": bool, "result": any, "error": str or None}\n'
+        "- Maximum 50 lines of code\n"
+        "- Only imports from the SAFE LIBRARIES list below\n"
+        "- NEVER use: eval, exec, subprocess, shutil, open() for writing, socket, ctypes\n"
+        "- Output ONLY the Python code inside a ```python code block\n"
+        "- The function name MUST match the TOOL_NAME specified below\n"
+    )
+
+    async def synthesize_with_retry(
+        self,
+        task: str,
+        tool_name: str,
+        inputs: dict[str, str],
+        outputs: list[str],
+        safe_libraries: list[str] | None = None,
+        max_attempts: int = 3,
+    ) -> dict[str, Any]:
+        """Synthesize a tool with structured retry using ReAct context.
+
+        Each failed attempt feeds the failure reason into the next attempt
+        for iterative self-correction.
+
+        Args:
+            task: Natural language description of what the tool must do.
+            tool_name: Required snake_case function name.
+            inputs: Dict mapping parameter names to type hint strings.
+            outputs: List of expected field names in the result dict.
+            safe_libraries: Allowed import modules for this tool.
+            max_attempts: Maximum synthesis attempts (capped at 3).
+
+        Returns:
+            Dict with keys: success, name, code_path, version, attempts, error.
+        """
+        max_attempts = min(max_attempts, 3)
+        allowed_libs = safe_libraries or [
+            "json", "os.path", "pathlib", "re", "datetime", "math",
+            "collections", "hashlib", "typing", "requests",
+        ]
+        last_error = ""
+        temperatures = [0.1, 0.3, 0.5]
+
+        for attempt in range(1, max_attempts + 1):
+            self.ui.console.print(
+                f"  [dim yellow]🔨 SYNTH: generating tool code... "
+                f"(attempt {attempt}/{max_attempts})[/dim yellow]"
+            )
+
+            prompt = self._build_react_prompt(
+                task=task,
+                tool_name=tool_name,
+                inputs=inputs,
+                outputs=outputs,
+                safe_libraries=allowed_libs,
+                last_error=last_error,
+                attempt=attempt,
+            )
+
+            temp = temperatures[min(attempt - 1, len(temperatures) - 1)]
+
+            try:
+                response = await self.llm.generate(
+                    prompt,
+                    system_prompt=self._REACT_SYNTHESIS_PROMPT,
+                    mode="code",
+                )
+            except Exception as exc:
+                last_error = f"LLM generation failed: {exc}"
+                logger.warning("Synthesis attempt %d: LLM error: %s", attempt, exc)
+                continue
+
+            code = self._extract_code(response)
+            if not code:
+                last_error = "Failed to extract valid Python code from LLM response"
+                logger.warning("Synthesis attempt %d: no code extracted", attempt)
+                continue
+
+            # Validate via AST risk check
+            self.ui.console.print(
+                "  [dim cyan]>> Validating generated code...[/dim cyan]"
+            )
+            validation = await self.validator.validate_async(
+                code, ui_layer=self.ui
+            )
+            if not validation.is_valid:
+                last_error = "; ".join(validation.errors)
+                logger.warning(
+                    "Synthesis attempt %d: validation failed: %s",
+                    attempt, last_error,
+                )
+                continue
+
+            self.ui.console.print(
+                f"  [dim green]✅ VALID: passed 4-level AST check "
+                f"(risk level {validation.risk_level})[/dim green]"
+            )
+
+            # Extract metadata
+            metadata = self._extract_metadata(code)
+            if not metadata:
+                last_error = "Could not extract function metadata from generated code"
+                continue
+
+            function_name = metadata["name"]
+            param_schema = metadata["parameters"]
+
+            # Sandbox test
+            self.ui.console.print(
+                "  [dim cyan]🧪 SANDBOX: testing execution...[/dim cyan]"
+            )
+            test_params = self.sandbox.generate_dummy_params(param_schema)
+            sandbox_start = __import__("time").time()
+            sandbox_result = await self.sandbox.execute(
+                code, function_name, test_params
+            )
+            sandbox_ms = int((__import__("time").time() - sandbox_start) * 1000)
+
+            if not sandbox_result["passed"]:
+                last_error = sandbox_result.get("error", "Sandbox test failed")
+                logger.warning(
+                    "Synthesis attempt %d: sandbox failed: %s",
+                    attempt, last_error,
+                )
+                self.ui.console.print(
+                    f"  [dim red]❌ SANDBOX: failed ({last_error[:80]})[/dim red]"
+                )
+                continue
+
+            self.ui.console.print(
+                f"  [dim green]🧪 SANDBOX: test execution passed "
+                f"({sandbox_ms}ms)[/dim green]"
+            )
+
+            # All checks passed — save and register
+            version = self.registry.get_version(tool_name) + 1
+            code_path = self.tools_dir / f"{tool_name}_v{version}.py"
+            code_path.write_text(code, encoding="utf-8")
+
+            self.ui.console.print(
+                f"  [dim green]💾 SAVED: {code_path}[/dim green]"
+            )
+
+            tool_id = self.registry.register(
+                name=tool_name,
+                description=task,
+                code_path=str(code_path),
+                parameters=param_schema,
+                created_by="react_engine",
+                version=version,
+                tags=self._extract_tags(task),
+            )
+
+            self.ui.console.print(
+                f"  [dim green]📋 REGISTER: brain.db updated "
+                f"(id={tool_id}, v{version})[/dim green]"
+            )
+
+            return {
+                "success": True,
+                "name": tool_name,
+                "tool_id": tool_id,
+                "description": task,
+                "code_path": str(code_path),
+                "parameters": param_schema,
+                "version": version,
+                "function_name": function_name,
+                "attempts": attempt,
+            }
+
+        # All attempts exhausted
+        logger.error(
+            "synthesize_with_retry failed after %d attempts for: %s",
+            max_attempts, task,
+        )
+        self.ui.console.print(
+            f"  [bold red]>> Tool synthesis failed after "
+            f"{max_attempts} attempts[/bold red]"
+        )
+        return {
+            "success": False,
+            "error": (
+                f"Could not synthesize working tool after {max_attempts} attempts. "
+                f"Last error: {last_error}"
+            ),
+            "attempts": max_attempts,
+        }
+
+    def _build_react_prompt(
+        self,
+        task: str,
+        tool_name: str,
+        inputs: dict[str, str],
+        outputs: list[str],
+        safe_libraries: list[str],
+        last_error: str = "",
+        attempt: int = 1,
+    ) -> str:
+        """Build the synthesis prompt with full ReAct context.
+
+        Args:
+            task: What the tool must do.
+            tool_name: Required function name.
+            inputs: Parameter name → type hint mapping.
+            outputs: Expected output field names.
+            safe_libraries: Allowed imports.
+            last_error: Error from previous attempt (empty on first).
+            attempt: Current attempt number.
+
+        Returns:
+            Formatted prompt string.
+        """
+        prompt = (
+            f"TOOL_NAME: {tool_name}\n"
+            f"TASK: {task}\n\n"
+        )
+
+        if inputs:
+            prompt += "REQUIRED PARAMETERS:\n"
+            for param, ptype in inputs.items():
+                prompt += f"  - {param}: {ptype}\n"
+            prompt += "\n"
+
+        if outputs:
+            prompt += (
+                f"EXPECTED OUTPUT FIELDS (inside result dict): "
+                f"{', '.join(outputs)}\n\n"
+            )
+
+        prompt += f"SAFE LIBRARIES (only these imports allowed): {', '.join(safe_libraries)}\n\n"
+
+        if last_error and attempt > 1:
+            prompt += (
+                f"⚠ PREVIOUS ATTEMPT {attempt - 1} FAILED:\n"
+                f"  Error: {last_error}\n\n"
+            )
+            if attempt == 2:
+                prompt += (
+                    f"Fix the issue. The tool MUST return a dict with "
+                    f"'success', 'result', and 'error' keys. "
+                    f"The 'result' value should contain: {', '.join(outputs)}.\n\n"
+                )
+            elif attempt >= 3:
+                prompt += (
+                    "This is the FINAL attempt. Write the SIMPLEST possible "
+                    "implementation that:\n"
+                    "1. Takes the specified parameters\n"
+                    "2. Performs the core task with minimal logic\n"
+                    "3. Returns the exact dict format required\n"
+                    "4. Wraps everything in try/except\n"
+                    "Do NOT overthink — just make it work.\n\n"
+                )
+
+        prompt += (
+            f"The function MUST:\n"
+            f"- Be named exactly: {tool_name}\n"
+            f"- Accept the parameters listed above with type hints\n"
+            f'- Return {{"success": True/False, "result": <value>, "error": None/str}}\n'
+            f"- Handle all exceptions with try/except\n"
+            f"- Be under 50 lines\n\n"
+            f"Output ONLY the Python code in a ```python block. No explanations."
+        )
+
+        return prompt

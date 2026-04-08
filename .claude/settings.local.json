@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s http://localhost:11434/api/tags)",
+      "Bash(python -c \"import sys,json; data=json.load\\(sys.stdin\\); [print\\(m[''''name''''], round\\(m.get\\(''''size'''',0\\)/1e9,1\\),''''GB''''\\) for m in data.get\\(''''models'''',[]\\)]\")",
+      "Bash(ollama list:*)",
+      "Bash(python main.py)",
+      "Bash(curl -s -X POST http://localhost:11434/api/chat -d \"{\"\"model\"\":\"\"qwen2.5-coder:7b\"\",\"\"messages\"\":[{\"\"role\"\":\"\"user\"\",\"\"content\"\":\"\"hi\"\"}],\"\"stream\"\":false,\"\"options\"\":{\"\"num_predict\"\":20}}\")",
+      "Bash(powershell -Command \"Get-StartApps | Where-Object {$_Name -like ''*Apple*'' -or $_Name -like ''*Music*''}\")",
+      "Bash(powershell -Command \"Get-StartApps | Where-Object Name -match ''Apple|Music'' | Select-Object Name, AppID\")",
+      "Bash(for file:*)",
+      "Bash(do)",
+      "Bash(if grep:*)",
+      "Bash(then)",
+      "Bash(echo \"$file: HAS IMPORT\")",
+      "Bash(do echo:*)",
+      "Bash(/tmp/audit_report.txt:*)",
+      "Read(//tmp/**)",
+      "Bash(done)",
+      "Bash(python3 -m py_compile /e/projects/jarvis/agents/api_agent.py /e/projects/jarvis/agents/data_agent.py /e/projects/jarvis/agents/email_agent.py /e/projects/jarvis/agents/workflow_agent.py /e/projects/jarvis/brain/decision_engine.py /e/projects/jarvis/brain/tool_synthesizer.py /e/projects/jarvis/core/orchestrator.py)",
+      "Bash(python -m py_compile agents/api_agent.py agents/data_agent.py agents/email_agent.py agents/workflow_agent.py brain/decision_engine.py brain/tool_synthesizer.py core/orchestrator.py)",
+      "Bash(do if:*)",
+      "Bash(then echo:*)",
+      "Bash(while read:*)",
+      "Bash(wc -l /e/projects/jarvis/agents/*.py /e/projects/jarvis/brain/*.py /e/projects/jarvis/core/*.py)",
+      "Bash(grep -n \"\\\\.generate\\(\" /e/projects/jarvis/memory/*.py /e/projects/jarvis/perception/*.py /e/projects/jarvis/tools/*.py /e/projects/jarvis/ui/*.py)",
+      "Bash(find /e/projects/jarvis -name \"*.py\" -not -path \"*/.venv/*\" -not -path \"*/__pycache__/*\" -not -path \"*/archived/*\" -type f -exec python -m py_compile {})",
+      "Bash(2)",
+      "Bash(mkdir -p tests scripts docs data/outputs)",
+      "Bash(mv test_brain.py test_news.py test_news2.py test_suite.py quick_test.py tests/)",
+      "Bash(mv _deactivate_tool.py _test_music.py scripts/)",
+      "Bash(mv \"AI News Summary.txt\" AI_News_Headlines.txt test_results.json data/outputs/)",
+      "Bash(mv CAPABILITIES.md DEVELOPMENT_LOG.md docs/)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''agents/terminal_agent.py''\\).read\\(\\)\\); print\\(''OK''\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''Ollama running. Models:'''', [m[''''name''''] for m in d.get\\(''''models'''',[]\\)]\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\(''agents/os_agent.py'', encoding=''utf-8''\\).read\\(\\)\\); print\\(''OK''\\)\")"
+    ]
+  }
+}

@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+data/
+external/
+tmp_jarvis_run.log
+tmp_jarvis_run.err.log
+*.pyc
+*.pyo
+*.pyd
+*.sqlite
+*.db
+*.log
+.env

@@ -1,0 +1,30 @@
+# Modelfile — JARVIS on Qwen2.5-Coder 7B Q4_K_M
+# RTX 3050 Laptop (4GB VRAM) — 4.7GB weights + KV cache
+# Supports native Ollama tool calling — structured JSON output
+
+FROM qwen2.5-coder:7b-instruct-q4_K_M
+
+# Push ALL layers to GPU
+PARAMETER num_gpu 99
+
+# Context: 8192 — Qwen2.5-Coder handles large conversations
+PARAMETER num_ctx 8192
+
+# Threads: 8 of 16 logical cores
+PARAMETER num_thread 8
+
+# Sampling — low temperature for deterministic tool selection
+PARAMETER temperature 0.1
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.1
+
+SYSTEM """You are JARVIS, a fully local AI OS agent on Windows 11.
+You are a REASONING and PLANNING engine only.
+You select tools by name and provide exact parameters.
+You NEVER answer real-time questions from your own knowledge.
+You NEVER hallucinate tool results or pretend to execute tools.
+You output ONLY valid JSON when asked for JSON.
+You NEVER add explanation outside JSON when JSON is requested.
+When no tool matches, you say exactly:
+"No tool available. I will create one."
+"""

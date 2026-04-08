@@ -1,0 +1,341 @@
+# config.yaml — JARVIS configuration
+# All modules read from this file. Never hardcode values in modules.
+
+
+llm_legacy:
+  # Legacy single-model settings — kept for reference only, not used by LLMCore
+  provider: "ollama"
+  base_url: "http://localhost:11434"
+  model: "qwen2.5-coder:7b"
+
+vision:
+  fast_model: "moondream"        # 1.8GB VRAM — default for most image tasks
+  deep_model: "llava:7b-v1.6-mistral-q4_K_M"  # 3.9GB — for complex analysis
+  screenshot_path: "data/screenshots/"
+  max_image_size_mb: 10
+
+ui:
+  stream_display: true
+  tts_enabled: true
+
+voice:
+  wake_word: "jarvis"
+  whisper_model: "base.en"       # Smallest English model — fastest on CPU
+  sample_rate: 16000
+  chunk_duration: 0.5            # seconds per audio chunk
+  silence_threshold: 500
+  tts_rate: 175                  # words per minute
+  tts_volume: 0.9
+
+memory:
+  graph_path: "data/knowledge_graph.json"
+  db_path: "data/interactions.db"
+  personal_model_path: "data/personal_model.json"
+  file_index_path: "data/file_index.json"
+  cache_path: "data/cache.db"
+  max_cache_entries: 500
+  cache_similarity_threshold: 0.92   # cosine similarity for cache hit
+  max_context_interactions: 3       # recent interactions injected per prompt
+  log_retention_days: 90
+
+agent:
+  root_paths:                    # Directories JARVIS has full access to
+    - "C:/"
+  watch_dirs:                    # Directories watched for real-time changes
+    - "C:/Users"
+    - "C:/jarvis"
+  max_file_read_chars: 8000      # Truncation limit for file content
+  max_search_results: 50
+
+orchestrator:
+  host: "127.0.0.1"
+  port: 8000
+  thread_pool_workers: 4         # ThreadPoolExecutor size (Ryzen 7 = 8 cores)
+
+intent:
+  classifier_model: "all-MiniLM-L6-v2"   # Tiny sentence-transformer for intent
+  confidence_threshold: 0.6
+  categories:
+    - TERMINAL_TASK
+    - OS_COMMAND
+    - FILE_OP
+    - IMAGE_ANALYZE
+    - MEMORY_QUERY
+    - CODE_TASK
+    - WEB_TASK
+    - CHAT
+    - SYSTEM_QUERY
+    - DATA_TASK
+    - EMAIL_TASK
+    - SCHEDULE_TASK
+    - API_TASK
+    - WORKFLOW
+
+email:
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587
+  imap_host: "imap.gmail.com"
+  imap_port: 993
+  address: "maahirfaheem666@gmail.com"          # your Gmail address
+  password: ""                            # Set via local env/secret store
+
+llm:
+  provider: ollama
+  base_url: http://localhost:11434
+  keep_alive: 5m
+
+  # Layer 1 — Fast responses (intent classify, simple chat, confirmations)
+  model_fast: qwen2.5-coder:7b
+  model_fast_max_tokens: 300
+  model_fast_timeout: 30
+  model_fast_temperature: 0.1
+
+  # Layer 2 — Deep reasoning (tool blueprints, multi-step planning, analysis)
+  model_reasoning: deepseek-r1:7b
+  model_reasoning_max_tokens: 2000
+  model_reasoning_timeout: 120
+  model_reasoning_temperature: 0.1
+
+  # Layer 3 — Code generation (tool codegen, bugfix, shell commands, regex)
+  model_code: qwen2.5-coder:7b
+  model_code_max_tokens: 2000
+  model_code_timeout: 45
+  model_code_temperature: 0.05
+
+  # Layer 4 — Vision (screenshot analysis, image OCR, visual QA)
+  model_vision: moondream:latest
+  model_vision_max_tokens: 500
+  model_vision_timeout: 30
+  model_vision_temperature: 0.1
+
+tool_calling:
+  enabled: true                   # Use native Ollama tool calling
+  fallback_model: "qwen2.5-coder:7b"   # Model for tool-call retries
+  max_tool_results: 5             # Max results to return from list-type tools
+  confirmation_required:          # Tools that need user confirmation before executing
+    - shutdown_computer
+    - restart_computer
+    - delete_file
+    - kill_process
+  tool_library_path: "tools/tool_library.py"
+
+brain:
+  db_path: "data/brain.db"
+  tools_dir: "brain/tools/generated"
+  builtin_dir: "brain/tools/builtin"
+  max_synthesis_retries: 3
+  sandbox_timeout: 15              # seconds
+  min_reliability_threshold: 0.7
+  similarity_threshold: 0.55
+  max_tool_lines: 50
+
+react:
+  max_iterations: 5                # hard cap per request — never infinite
+  enabled: true                    # set false to bypass ReAct and use legacy routing
+
+validator:
+  testing_mode: true               # true = allow ALL code (no blocking), false = enforce risk levels
+  risk_levels:
+    level_0:                       # Always allow — safe stdlib
+      - json
+      - os
+      - os.path
+      - pathlib
+      - re
+      - datetime
+      - sqlite3
+      - typing
+      - math
+      - random
+      - string
+      - time
+      - collections
+      - itertools
+      - functools
+      - hashlib
+      - base64
+      - uuid
+      - csv
+      - io
+      - copy
+      - textwrap
+      - unicodedata
+      - struct
+      - enum
+      - dataclasses
+      - operator
+      - statistics
+      - decimal
+      - fractions
+      - calendar
+      - zlib
+      - difflib
+      - pprint
+      - urllib
+      - urllib.parse
+    level_1:                       # Allow with logging — data/utility
+      - requests
+      - pdfplumber
+      - PyPDF2
+      - PIL
+      - Pillow
+      - bs4
+      - openpyxl
+      - pandas
+      - numpy
+      - psutil
+      - pydantic
+      - sentence_transformers
+      - sklearn
+      - cv2
+      - docx
+      - xlrd
+      - pdfminer
+      - pypdfium2
+      - markdown
+      - yaml
+      - toml
+      - chardet
+      - ftfy
+      - tqdm
+      - rich
+      - loguru
+      - lxml
+    level_2:                       # Require human approval — system access
+      - win32api
+      - win32con
+      - winreg
+      - ctypes
+      - pyautogui
+      - keyboard
+      - mouse
+      - pygetwindow
+      - comtypes
+      - pynput
+      - pywin32
+      - wmi
+      - screeninfo
+    level_3:                       # Always block — dangerous
+      - subprocess
+      - shutil
+      - socket
+      - pickle
+      - marshal
+      - importlib
+      - multiprocessing
+      - threading
+
+# ── MCP — Model Context Protocol Servers ──────────────────────────────────────
+mcp:
+  enabled: true
+  connection_timeout: 30           # seconds to wait for server startup
+  tool_timeout: 30                 # seconds to wait for tool execution
+  auto_reconnect: true             # reconnect on server crash
+  health_check_interval: 300       # seconds between background health pings
+
+  servers:
+    filesystem:
+      enabled: true
+      transport: stdio
+      command: npx
+      args:
+        - "-y"
+        - "@modelcontextprotocol/server-filesystem"
+        - "C:/Users"
+        - "E:/projects"
+
+    fetch:
+      enabled: true
+      transport: stdio
+      command: uvx
+      args:
+        - "mcp-server-fetch"
+
+    memory:
+      enabled: true
+      transport: stdio
+      command: npx
+      args:
+        - "-y"
+        - "@modelcontextprotocol/server-memory"
+
+    brave_search:
+      enabled: false               # Disabled: external API key/service
+      transport: stdio
+      command: npx
+      args:
+        - "-y"
+        - "@modelcontextprotocol/server-brave-search"
+      env:
+        BRAVE_API_KEY: ""
+
+    duckduckgo:
+      enabled: true                # Free — no API key needed
+      transport: stdio
+      command: npx
+      args:
+        - "-y"
+        - "@nicekid1/mcp-server-duckduckgo"
+
+    github:
+      enabled: false               # Disabled: external account/token
+      transport: stdio
+      command: npx
+      args:
+        - "-y"
+        - "@modelcontextprotocol/server-github"
+      env:
+        GITHUB_PERSONAL_ACCESS_TOKEN: ""
+
+    puppeteer:
+      enabled: false               # Free, but heavier — enable when needed
+      transport: stdio
+      command: npx
+      args:
+        - "-y"
+        - "@modelcontextprotocol/server-puppeteer"
+
+    sqlite:
+      enabled: true
+      transport: stdio
+      command: uvx
+      args:
+        - "mcp-server-sqlite"
+        - "--db-path"
+        - "data/brain.db"
+
+    gmail:
+      enabled: false               # Disabled: external account/OAuth
+      transport: stdio
+      command: npx
+      args:
+        - "-y"
+        - "@modelcontextprotocol/server-gmail"
+
+    slack:
+      enabled: false               # Disabled: external account/token
+      transport: stdio
+      command: npx
+      args:
+        - "-y"
+        - "@modelcontextprotocol/server-slack"
+      env:
+        SLACK_BOT_TOKEN: ""
+
+    gdrive:
+      enabled: false               # Disabled: external account/OAuth
+      transport: stdio
+      command: npx
+      args:
+        - "-y"
+        - "@modelcontextprotocol/server-gdrive"
+
+    windows_mcp:
+      enabled: true
+      transport: stdio
+      command: ".\\.venv\\Scripts\\python.exe"
+      args:
+        - "-m"
+        - "windows_mcp"
+      env:
+        ANONYMIZED_TELEMETRY: "false"

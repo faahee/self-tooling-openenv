@@ -1,0 +1,28 @@
+name: support-triage-openenv
+version: 0.1.0
+description: A real-world support inbox triage environment for evaluating agentic decision making across billing, technical, security, spam, and product tickets.
+entrypoint: support_triage_env.server:app
+tags:
+  - openenv
+  - customer-support
+  - triage
+  - email
+api:
+  health: /health
+  reset: /reset
+  step: /step
+  state: /state
+models:
+  observation: support_triage_env.models.SupportTriageObservation
+  action: support_triage_env.models.SupportTriageAction
+  reward: support_triage_env.models.SupportTriageReward
+tasks:
+  - name: easy_refund_triage
+    difficulty: easy
+    objective: Triage a single billing refund request.
+  - name: medium_inbox_triage
+    difficulty: medium
+    objective: Triage a mixed inbox with outage, refund, and spam.
+  - name: hard_enterprise_inbox
+    difficulty: hard
+    objective: Handle an enterprise inbox with outage, privacy, billing, and product tickets.

@@ -1,0 +1,364 @@
+"""Code Validator — AST-based static analysis for synthesized tool code safety."""
+from __future__ import annotations
+
+import ast
+import logging
+from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ValidationResult:
+    """Result of code validation."""
+
+    is_valid: bool
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+class CodeValidator:
+    """Validates synthesized Python code for safety and correctness.
+
+    Uses ast-based static analysis to detect dangerous patterns,
+    blocked imports, and structural violations. No external tools required.
+    """
+
+    ALLOWED_IMPORTS: frozenset[str] = frozenset(
+        {
+            "json",
+            "os",
+            "os.path",
+            "pathlib",
+            "re",
+            "datetime",
+            "sqlite3",
+            "requests",
+            "typing",
+            "math",
+            "collections",
+            "hashlib",
+            "io",
+            "csv",
+            "base64",
+            "urllib",
+            "urllib.parse",
+            "string",
+            "textwrap",
+            "functools",
+            "itertools",
+            "operator",
+            "statistics",
+            "decimal",
+            "fractions",
+            "random",
+            "uuid",
+            "time",
+            "calendar",
+            "zlib",
+            "struct",
+            "enum",
+            "dataclasses",
+            "copy",
+            "difflib",
+            "pprint",
+            # Data / document processing
+            "PyPDF2",
+            "pdfplumber",
+            "PIL",
+            "bs4",
+            "lxml",
+            "openpyxl",
+            "xlrd",
+            "chardet",
+            "psutil",
+        }
+    )
+
+    ALLOWED_IMPORT_ROOTS: frozenset[str] = frozenset(
+        {m.split(".")[0] for m in ALLOWED_IMPORTS}
+    )
+
+    BLOCKED_CALL_PATTERNS: frozenset[str] = frozenset(
+        {
+            "os.system",
+            "subprocess.call",
+            "subprocess.run",
+            "subprocess.Popen",
+            "subprocess.check_output",
+            "subprocess.check_call",
+            "shutil.rmtree",
+            "shutil.rmdir",
+            "shutil.move",
+            "os.remove",
+            "os.unlink",
+            "os.rmdir",
+            "os.makedirs",
+            "os.mkdir",
+        }
+    )
+
+    BLOCKED_BUILTINS: frozenset[str] = frozenset(
+        {
+            "eval",
+            "exec",
+            "__import__",
+            "compile",
+            "globals",
+            "locals",
+            "breakpoint",
+            "exit",
+            "quit",
+        }
+    )
+
+    BLOCKED_IMPORT_MODULES: frozenset[str] = frozenset(
+        {
+            "subprocess",
+            "shutil",
+            "socket",
+            "ctypes",
+            "win32api",
+            "win32com",
+            "winreg",
+            "signal",
+            "multiprocessing",
+            "threading",
+            "pickle",
+            "shelve",
+            "marshal",
+            "code",
+            "codeop",
+            "importlib",
+            "runpy",
+            "sys",
+            "builtins",
+        }
+    )
+
+    BLOCKED_ATTR_WRITES: frozenset[str] = frozenset(
+        {
+            "write",
+            "write_text",
+            "write_bytes",
+            "unlink",
+            "rmdir",
+            "rename",
+            "replace",
+            "mkdir",
+            "makedirs",
+            "symlink_to",
+            "hardlink_to",
+            "touch",
+        }
+    )
+
+    def validate(self, code: str) -> ValidationResult:
+        """Run all validation checks on generated code.
+
+        Args:
+            code: Python source code string.
+
+        Returns:
+            ValidationResult with is_valid flag and any errors/warnings.
+        """
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        syntax_errors = self._check_syntax(code)
+        if syntax_errors:
+            return ValidationResult(is_valid=False, errors=syntax_errors)
+
+        errors.extend(self._check_blocked_patterns(code))
+        errors.extend(self._check_imports(code))
+        errors.extend(self._check_blocked_builtins(code))
+        errors.extend(self._check_function_structure(code))
+        errors.extend(self._check_file_operations(code))
+
+        line_count = len(code.strip().splitlines())
+        if line_count > 60:
+            errors.append(
+                f"Code has {line_count} lines (max allowed: 60, recommended: 50)"
+            )
+        elif line_count > 50:
+            warnings.append(f"Code has {line_count} lines (recommended max: 50)")
+
+        return ValidationResult(
+            is_valid=len(errors) == 0,
+            errors=errors,
+            warnings=warnings,
+        )
+
+    def _check_syntax(self, code: str) -> list[str]:
+        """Verify code is syntactically valid Python.
+
+        Args:
+            code: Python source code.
+
+        Returns:
+            List of syntax error messages.
+        """
+        try:
+            ast.parse(code)
+            return []
+        except SyntaxError as exc:
+            return [f"Syntax error at line {exc.lineno}: {exc.msg}"]
+
+    def _check_blocked_patterns(self, code: str) -> list[str]:
+        """Check for dangerous call patterns using AST traversal.
+
+        Args:
+            code: Python source code.
+
+        Returns:
+            List of violation messages.
+        """
+        errors: list[str] = []
+        tree = ast.parse(code)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                call_name = self._get_call_name(node)
+                if call_name and call_name in self.BLOCKED_CALL_PATTERNS:
+                    errors.append(f"Blocked dangerous call: {call_name}()")
+
+        return errors
+
+    def _check_imports(self, code: str) -> list[str]:
+        """Validate that only allowed modules are imported.
+
+        Args:
+            code: Python source code.
+
+        Returns:
+            List of import violation messages.
+        """
+        errors: list[str] = []
+        tree = ast.parse(code)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_root = alias.name.split(".")[0]
+                    if module_root in self.BLOCKED_IMPORT_MODULES:
+                        errors.append(f"Blocked import: {alias.name}")
+                    elif module_root not in self.ALLOWED_IMPORT_ROOTS:
+                        errors.append(f"Disallowed import: {alias.name}")
+
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    module_root = node.module.split(".")[0]
+                    if module_root in self.BLOCKED_IMPORT_MODULES:
+                        errors.append(f"Blocked import from: {node.module}")
+                    elif module_root not in self.ALLOWED_IMPORT_ROOTS:
+                        errors.append(f"Disallowed import from: {node.module}")
+
+        return errors
+
+    def _check_blocked_builtins(self, code: str) -> list[str]:
+        """Check for use of blocked builtin functions.
+
+        Args:
+            code: Python source code.
+
+        Returns:
+            List of violation messages.
+        """
+        errors: list[str] = []
+        tree = ast.parse(code)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                if (
+                    isinstance(node.func, ast.Name)
+                    and node.func.id in self.BLOCKED_BUILTINS
+                ):
+                    errors.append(f"Blocked builtin call: {node.func.id}()")
+
+        return errors
+
+    def _check_function_structure(self, code: str) -> list[str]:
+        """Verify the code has exactly one function definition and no classes.
+
+        Args:
+            code: Python source code.
+
+        Returns:
+            List of structural violation messages.
+        """
+        errors: list[str] = []
+        tree = ast.parse(code)
+
+        functions = [n for n in ast.iter_child_nodes(tree) if isinstance(n, ast.FunctionDef)]
+        classes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+
+        if classes:
+            errors.append("Class definitions are not allowed in generated tools")
+
+        if not functions:
+            errors.append(
+                "No function definition found — tool must define exactly one function"
+            )
+        elif len(functions) > 1:
+            errors.append(
+                f"Found {len(functions)} top-level functions — tool must have exactly one"
+            )
+
+        return errors
+
+    def _check_file_operations(self, code: str) -> list[str]:
+        """Block open() calls and filesystem write operations.
+
+        Args:
+            code: Python source code.
+
+        Returns:
+            List of file operation violation messages.
+        """
+        errors: list[str] = []
+        tree = ast.parse(code)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                # Allow open() only in read mode ("r", "rb") — block write modes
+                if isinstance(node.func, ast.Name) and node.func.id == "open":
+                    mode = "r"  # default
+                    if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+                        mode = node.args[1].value
+                    for kw in node.keywords:
+                        if kw.arg == "mode" and isinstance(kw.value, ast.Constant):
+                            mode = kw.value.value
+                    if isinstance(mode, str) and any(c in mode for c in ("w", "a", "x")):
+                        errors.append("Blocked: open() in write/append mode is not allowed")
+
+                # Block dangerous method calls (.write(), .unlink(), etc.)
+                if isinstance(node.func, ast.Attribute):
+                    if node.func.attr in self.BLOCKED_ATTR_WRITES:
+                        errors.append(
+                            f"Blocked: .{node.func.attr}() is not allowed in generated tools"
+                        )
+
+        return errors
+
+    @staticmethod
+    def _get_call_name(node: ast.Call) -> str | None:
+        """Extract the dotted name of a function call from an AST Call node.
+
+        Args:
+            node: ast.Call node.
+
+        Returns:
+            Dotted name string (e.g. 'os.system') or None.
+        """
+        if isinstance(node.func, ast.Name):
+            return node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            parts: list[str] = []
+            current = node.func
+            while isinstance(current, ast.Attribute):
+                parts.append(current.attr)
+                current = current.value
+            if isinstance(current, ast.Name):
+                parts.append(current.id)
+            return ".".join(reversed(parts))
+        return None
