@@ -6,6 +6,7 @@ COPY requirements-openenv.txt /app/requirements-openenv.txt
 RUN pip install --no-cache-dir -r /app/requirements-openenv.txt
 
 COPY support_triage_env /app/support_triage_env
+COPY server /app/server
 COPY openenv.yaml /app/openenv.yaml
 COPY README.md /app/README.md
 COPY inference.py /app/inference.py

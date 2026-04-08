@@ -1,28 +1,100 @@
 name: support-triage-openenv
 version: 0.1.0
-description: A real-world support inbox triage environment for evaluating agentic decision making across billing, technical, security, spam, and product tickets.
+description: >
+  A real-world support inbox triage environment for evaluating agentic decision making
+  across billing, technical, security, spam, and product tickets.
+author: faheem07
 entrypoint: support_triage_env.server:app
 tags:
   - openenv
   - customer-support
   - triage
   - email
-api:
-  health: /health
-  reset: /reset
-  step: /step
-  state: /state
+  - rl-environment
+
+tasks:
+  - id: easy_refund_triage
+    difficulty: easy
+    description: Triage a single billing refund request.
+    reset_params:
+      task_name: easy_refund_triage
+  - id: medium_inbox_triage
+    difficulty: medium
+    description: Triage a mixed inbox with outage, refund, and spam.
+    reset_params:
+      task_name: medium_inbox_triage
+  - id: hard_enterprise_inbox
+    difficulty: hard
+    description: Handle an enterprise inbox with outage, privacy, billing, and product tickets.
+    reset_params:
+      task_name: hard_enterprise_inbox
+
+action_space:
+  type: object
+  properties:
+    action_type:
+      type: string
+      enum: [classify, prioritize, assign, reply, set_status, noop]
+    ticket_id:
+      type: string
+      nullable: true
+    category:
+      type: string
+      enum: [billing, technical, security, product, spam, general]
+      nullable: true
+    priority:
+      type: string
+      enum: [low, normal, high, urgent]
+      nullable: true
+    queue:
+      type: string
+      nullable: true
+    status:
+      type: string
+      enum: [open, pending, resolved, closed, spam]
+      nullable: true
+    message:
+      type: string
+      nullable: true
+  required:
+    - action_type
+
+observation_space:
+  type: object
+  properties:
+    task_name:
+      type: string
+    objective:
+      type: string
+    step_count:
+      type: integer
+    max_steps:
+      type: integer
+    cumulative_score:
+      type: number
+    last_action_error:
+      type: string
+      nullable: true
+    tickets:
+      type: array
+    allowed_actions:
+      type: array
+
+reward:
+  min: 0.0
+  max: 1.0
+  description: >
+    Dense reward shaped by score improvement, small forward-progress bonuses,
+    and penalties for invalid or repeated actions.
+
 models:
   observation: support_triage_env.models.SupportTriageObservation
   action: support_triage_env.models.SupportTriageAction
   reward: support_triage_env.models.SupportTriageReward
-tasks:
-  - name: easy_refund_triage
-    difficulty: easy
-    objective: Triage a single billing refund request.
-  - name: medium_inbox_triage
-    difficulty: medium
-    objective: Triage a mixed inbox with outage, refund, and spam.
-  - name: hard_enterprise_inbox
-    difficulty: hard
-    objective: Handle an enterprise inbox with outage, privacy, billing, and product tickets.
+  state: support_triage_env.models.SupportTriageState
+
+endpoints:
+  health: GET /health
+  reset: POST /reset
+  step: POST /step
+  state: GET /state
